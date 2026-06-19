@@ -100,34 +100,47 @@ async def get_call(
     store: CallStore = Depends(get_call_store),
 ) -> CallStatus:
     cached = store.get(call_id)
-    
-    # If the call is already in a terminal state, just return the cache
-    if cached and cached.status in ["ended", "failed"]:
+
+    # Only skip Vapi polling if we already have a terminal record WITH an
+    # ended_at timestamp — meaning a webhook (or a previous poll) already
+    # fully settled the call. This prevents returning a stale "in-progress"
+    # indefinitely when webhooks are not configured.
+    terminal_statuses = {"ended", "failed"}
+    if cached and cached.status in terminal_statuses and cached.ended_at is not None:
         return cached
 
-    # Polling fallback: if webhooks are not configured, poll Vapi for updates
+    # Polling fallback: always ask Vapi for the latest state so the UI
+    # reflects reality even when webhooks are not configured.
     try:
         vapi_response = await vapi.get_call(call_id)
-        status_val = vapi_response.get("status")
+        status_val = _normalise_vapi_status(vapi_response.get("status"))
         transcript = vapi_response.get("transcript")
         cost = vapi_response.get("cost")
-        
+
         if cached:
-            updates = {}
-            if status_val: updates["status"] = status_val
-            if transcript: updates["transcript"] = transcript
-            if cost is not None: updates["cost"] = float(cost)
-            
+            updates: dict = {}
+            if status_val:
+                updates["status"] = status_val
+            if transcript:
+                updates["transcript"] = transcript
+            if cost is not None:
+                updates["cost"] = float(cost)
+            # Always stamp ended_at when transitioning to a terminal state
+            # so the CallStore can compute duration_seconds correctly.
+            if status_val in terminal_statuses and cached.ended_at is None:
+                updates["ended_at"] = datetime.now(UTC)
+
             if updates:
                 updated_call = store.update_status(call_id, **updates)
                 if updated_call:
                     return updated_call
             return cached
 
-        # If not cached at all, create it
+        # Call not in our store at all — reconstruct from Vapi response.
         scenario, phone_number = _extract_metadata(vapi_response)
         if not scenario or not phone_number:
             raise CallNotFoundException("Call not found.")
+        is_terminal = status_val in terminal_statuses
         return CallStatus(
             call_id=vapi_response.get("id", call_id),
             status=status_val or "queued",
@@ -135,6 +148,7 @@ async def get_call(
             scenario=scenario,
             transcript=transcript,
             cost=float(cost) if cost is not None else None,
+            ended_at=datetime.now(UTC) if is_terminal else None,
         )
     except Exception as e:
         logger.error("vapi_poll_failed", error=str(e))
@@ -153,6 +167,17 @@ async def end_call(
     await vapi.end_call(call_id)
     store.update_status(call_id, status="ended", ended_at=datetime.now(UTC))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _normalise_vapi_status(vapi_status: str | None) -> str | None:
+    """Map Vapi status values to our internal CallStatusType literals.
+
+    Vapi can return "completed" on GET /call/{id} in some API versions.
+    We normalise it to "ended" so Pydantic validation never rejects it.
+    """
+    if vapi_status == "completed":
+        return "ended"
+    return vapi_status
 
 
 def _extract_metadata(payload: Dict[str, Any]) -> tuple[str | None, str | None]:
